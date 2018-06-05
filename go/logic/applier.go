@@ -78,21 +78,23 @@ func (this *Applier) InitDBConnections() (err error) {
 		return err
 	}
 	this.singletonDB.SetMaxOpenConns(1)
-	version, err := base.ValidateConnection(this.db, this.connectionConfig)
+	version, err := base.ValidateConnection(this.db, this.connectionConfig, this.migrationContext)
 	if err != nil {
 		return err
 	}
-	if _, err := base.ValidateConnection(this.singletonDB, this.connectionConfig); err != nil {
+	if _, err := base.ValidateConnection(this.singletonDB, this.connectionConfig, this.migrationContext); err != nil {
 		return err
 	}
 	this.migrationContext.ApplierMySQLVersion = version
 	if err := this.validateAndReadTimeZone(); err != nil {
 		return err
 	}
-	if impliedKey, err := mysql.GetInstanceKey(this.db); err != nil {
-		return err
-	} else {
-		this.connectionConfig.ImpliedKey = impliedKey
+	if !this.migrationContext.AliyunRDS {
+		if impliedKey, err := mysql.GetInstanceKey(this.db); err != nil {
+			return err
+		} else {
+			this.connectionConfig.ImpliedKey = impliedKey
+		}
 	}
 	if err := this.readTableColumns(); err != nil {
 		return err
@@ -115,7 +117,7 @@ func (this *Applier) validateAndReadTimeZone() error {
 // readTableColumns reads table columns on applier
 func (this *Applier) readTableColumns() (err error) {
 	log.Infof("Examining table structure on applier")
-	this.migrationContext.OriginalTableColumnsOnApplier, err = mysql.GetTableColumns(this.db, this.migrationContext.DatabaseName, this.migrationContext.OriginalTableName)
+	this.migrationContext.OriginalTableColumnsOnApplier, _, err = mysql.GetTableColumns(this.db, this.migrationContext.DatabaseName, this.migrationContext.OriginalTableName)
 	if err != nil {
 		return err
 	}
@@ -288,7 +290,7 @@ func (this *Applier) WriteChangelog(hint, value string) (string, error) {
 		sql.EscapeName(this.migrationContext.DatabaseName),
 		sql.EscapeName(this.migrationContext.GetChangelogTableName()),
 	)
-	_, err := sqlutils.Exec(this.db, query, explicitId, hint, value)
+	_, err := sqlutils.ExecNoPrepare(this.db, query, explicitId, hint, value)
 	return hint, err
 }
 

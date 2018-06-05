@@ -53,10 +53,12 @@ func (this *Inspector) InitDBConnections() (err error) {
 	if err := this.validateConnection(); err != nil {
 		return err
 	}
-	if impliedKey, err := mysql.GetInstanceKey(this.db); err != nil {
-		return err
-	} else {
-		this.connectionConfig.ImpliedKey = impliedKey
+	if !this.migrationContext.AliyunRDS {
+		if impliedKey, err := mysql.GetInstanceKey(this.db); err != nil {
+			return err
+		} else {
+			this.connectionConfig.ImpliedKey = impliedKey
+		}
 	}
 	if err := this.validateGrants(); err != nil {
 		return err
@@ -87,24 +89,24 @@ func (this *Inspector) ValidateOriginalTable() (err error) {
 	return nil
 }
 
-func (this *Inspector) InspectTableColumnsAndUniqueKeys(tableName string) (columns *sql.ColumnList, uniqueKeys [](*sql.UniqueKey), err error) {
+func (this *Inspector) InspectTableColumnsAndUniqueKeys(tableName string) (columns *sql.ColumnList, virtualColumns *sql.ColumnList, uniqueKeys [](*sql.UniqueKey), err error) {
 	uniqueKeys, err = this.getCandidateUniqueKeys(tableName)
 	if err != nil {
-		return columns, uniqueKeys, err
+		return columns, virtualColumns, uniqueKeys, err
 	}
 	if len(uniqueKeys) == 0 {
-		return columns, uniqueKeys, fmt.Errorf("No PRIMARY nor UNIQUE key found in table! Bailing out")
+		return columns, virtualColumns, uniqueKeys, fmt.Errorf("No PRIMARY nor UNIQUE key found in table! Bailing out")
 	}
-	columns, err = mysql.GetTableColumns(this.db, this.migrationContext.DatabaseName, tableName)
+	columns, virtualColumns, err = mysql.GetTableColumns(this.db, this.migrationContext.DatabaseName, tableName)
 	if err != nil {
-		return columns, uniqueKeys, err
+		return columns, virtualColumns, uniqueKeys, err
 	}
 
-	return columns, uniqueKeys, nil
+	return columns, virtualColumns, uniqueKeys, nil
 }
 
 func (this *Inspector) InspectOriginalTable() (err error) {
-	this.migrationContext.OriginalTableColumns, this.migrationContext.OriginalTableUniqueKeys, err = this.InspectTableColumnsAndUniqueKeys(this.migrationContext.OriginalTableName)
+	this.migrationContext.OriginalTableColumns, this.migrationContext.OriginalTableVirtualColumns, this.migrationContext.OriginalTableUniqueKeys, err = this.InspectTableColumnsAndUniqueKeys(this.migrationContext.OriginalTableName)
 	if err != nil {
 		return err
 	}
@@ -120,7 +122,7 @@ func (this *Inspector) inspectOriginalAndGhostTables() (err error) {
 		return fmt.Errorf("It seems like table structure is not identical between master and replica. This scenario is not supported.")
 	}
 
-	this.migrationContext.GhostTableColumns, this.migrationContext.GhostTableUniqueKeys, err = this.InspectTableColumnsAndUniqueKeys(this.migrationContext.GetGhostTableName())
+	this.migrationContext.GhostTableColumns, this.migrationContext.GhostTableVirtualColumns, this.migrationContext.GhostTableUniqueKeys, err = this.InspectTableColumnsAndUniqueKeys(this.migrationContext.GetGhostTableName())
 	if err != nil {
 		return err
 	}
@@ -163,13 +165,8 @@ func (this *Inspector) inspectOriginalAndGhostTables() (err error) {
 			return fmt.Errorf("Chosen key (%s) has nullable columns. Bailing out. To force this operation to continue, supply --allow-nullable-unique-key flag. Only do so if you are certain there are no actual NULL values in this key. As long as there aren't, migration should be fine. NULL values in columns of this key will corrupt migration's data", this.migrationContext.UniqueKey)
 		}
 	}
-	if !this.migrationContext.UniqueKey.IsPrimary() {
-		if this.migrationContext.OriginalBinlogRowImage != "FULL" {
-			return fmt.Errorf("binlog_row_image is '%s' and chosen key is %s, which is not the primary key. This operation cannot proceed. You may `set global binlog_row_image='full'` and try again", this.migrationContext.OriginalBinlogRowImage, this.migrationContext.UniqueKey)
-		}
-	}
 
-	this.migrationContext.SharedColumns, this.migrationContext.MappedSharedColumns = this.getSharedColumns(this.migrationContext.OriginalTableColumns, this.migrationContext.GhostTableColumns, this.migrationContext.ColumnRenameMap)
+	this.migrationContext.SharedColumns, this.migrationContext.MappedSharedColumns = this.getSharedColumns(this.migrationContext.OriginalTableColumns, this.migrationContext.GhostTableColumns, this.migrationContext.OriginalTableVirtualColumns, this.migrationContext.GhostTableVirtualColumns, this.migrationContext.ColumnRenameMap)
 	log.Infof("Shared columns are %s", this.migrationContext.SharedColumns)
 	// By fact that a non-empty unique key exists we also know the shared columns are non-empty
 
@@ -203,7 +200,7 @@ func (this *Inspector) validateConnection() error {
 		return fmt.Errorf("MySQL replication length limited to 32 characters. See https://dev.mysql.com/doc/refman/5.7/en/assigning-passwords.html")
 	}
 
-	version, err := base.ValidateConnection(this.db, this.connectionConfig)
+	version, err := base.ValidateConnection(this.db, this.connectionConfig, this.migrationContext)
 	this.migrationContext.InspectorMySQLVersion = version
 	return err
 }
@@ -356,6 +353,9 @@ func (this *Inspector) validateBinlogs() error {
 		this.migrationContext.OriginalBinlogRowImage = "FULL"
 	}
 	this.migrationContext.OriginalBinlogRowImage = strings.ToUpper(this.migrationContext.OriginalBinlogRowImage)
+	if this.migrationContext.OriginalBinlogRowImage != "FULL" {
+		return fmt.Errorf("%s:%d has '%s' binlog_row_image, and only 'FULL' is supported. This operation cannot proceed. You may `set global binlog_row_image='full'` and try again", this.connectionConfig.Key.Hostname, this.connectionConfig.Key.Port, this.migrationContext.OriginalBinlogRowImage)
+	}
 
 	log.Infof("binary logs validated on %s:%d", this.connectionConfig.Key.Hostname, this.connectionConfig.Key.Port)
 	return nil
@@ -692,7 +692,7 @@ func (this *Inspector) getSharedUniqueKeys(originalUniqueKeys, ghostUniqueKeys [
 }
 
 // getSharedColumns returns the intersection of two lists of columns in same order as the first list
-func (this *Inspector) getSharedColumns(originalColumns, ghostColumns *sql.ColumnList, columnRenameMap map[string]string) (*sql.ColumnList, *sql.ColumnList) {
+func (this *Inspector) getSharedColumns(originalColumns, ghostColumns *sql.ColumnList, originalVirtualColumns, ghostVirtualColumns *sql.ColumnList, columnRenameMap map[string]string) (*sql.ColumnList, *sql.ColumnList) {
 	sharedColumnNames := []string{}
 	for _, originalColumn := range originalColumns.Names() {
 		isSharedColumn := false
@@ -706,6 +706,16 @@ func (this *Inspector) getSharedColumns(originalColumns, ghostColumns *sql.Colum
 		}
 		for droppedColumn := range this.migrationContext.DroppedColumnsMap {
 			if strings.EqualFold(originalColumn, droppedColumn) {
+				isSharedColumn = false
+			}
+		}
+		for _, virtualColumn := range originalVirtualColumns.Names() {
+			if strings.EqualFold(originalColumn, virtualColumn) {
+				isSharedColumn = false
+			}
+		}
+		for _, virtualColumn := range ghostVirtualColumns.Names() {
+			if strings.EqualFold(originalColumn, virtualColumn) {
 				isSharedColumn = false
 			}
 		}
